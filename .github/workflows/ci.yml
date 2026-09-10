@@ -1,0 +1,52 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    name: make check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # gpg and GNU tar are already on the runner. zstd is the default
+      # compressor, and make lint skips shellcheck when it is missing.
+      - name: Install zstd and shellcheck
+        run: sudo apt-get update -qq && sudo apt-get install -y zstd shellcheck
+
+      - name: make check
+        run: make check
+
+  install:
+    name: The installed copy works without the checkout
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install zstd
+        run: sudo apt-get update -qq && sudo apt-get install -y zstd
+
+      # A copied command that cannot find its ruleset fails only on a real run,
+      # so this installs outside the checkout and runs from somewhere else.
+      - name: make install, then run from /
+        run: |
+          set -euo pipefail
+          mkdir -p "$HOME/bin"
+          make install PREFIX="$HOME/bin"
+          cd /
+          mkdir -p /tmp/tree/proj/node_modules /tmp/tree/proj/src
+          echo dep > /tmp/tree/proj/node_modules/x
+          echo src > /tmp/tree/proj/src/main.js
+          out="$("$HOME/bin/dev-snapshot" rules --source /tmp/tree)"
+          echo "$out"
+          grep -q "node_modules" <<< "$out"

@@ -1,0 +1,73 @@
+name: Release
+
+# Tagging is the whole trigger: `git tag v1.2.3 && git push --tags` checks the
+# tag, `dev-snapshot --version` and the changelog agree, proves the tagged
+# commit passes and installs, then publishes a GitHub Release whose body is
+# that version's changelog section.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to release, without the leading v (e.g. 1.2.3)"
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Work out which version this is
+        id: pick
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            version="${{ inputs.version }}"
+          else
+            version="${GITHUB_REF_NAME#v}"
+          fi
+          # The tag and the tool have to report the same version.
+          declared="$(bin/dev-snapshot --version | awk '{print $2}')"
+          if [ "$version" != "$declared" ]; then
+            echo "::error::tag says $version, bin/dev-snapshot says $declared"
+            exit 1
+          fi
+          # A release with no notes is one nobody can read, so this stops here
+          # rather than publishing an empty body.
+          packaging/release-notes.sh "$version" > /dev/null
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Install zstd and shellcheck
+        run: sudo apt-get update -qq && sudo apt-get install -y zstd shellcheck
+
+      - name: make check
+        run: make check
+
+      # The release is the source itself, so the proof is that it installs and
+      # the installed copy can find its ruleset.
+      - name: make install into a scratch prefix
+        run: |
+          set -euo pipefail
+          prefix="$(mktemp -d)"
+          make install PREFIX="$prefix"
+
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          version="${{ steps.pick.outputs.version }}"
+          packaging/release-notes.sh "$version" > notes.md
+          if gh release view "v${version}" >/dev/null 2>&1; then
+            echo "v${version} exists: updating its notes"
+            gh release edit "v${version}" --title "dev-snapshot ${version}" --notes-file notes.md
+          else
+            gh release create "v${version}" --target "$GITHUB_SHA" \
+              --title "dev-snapshot ${version}" --notes-file notes.md
+          fi

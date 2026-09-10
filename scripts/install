@@ -1,0 +1,40 @@
+#!/usr/bin/env bash
+#
+# install -- put dev-snapshot on your PATH.
+#
+# Usage:
+#   scripts/install [PREFIX]     default: ~/bin
+#
+# Copies rather than symlinks. The command resolves its own directory to find
+# dev-snapshot.d beside it; a symlink would resolve to THIS checkout, and the
+# command would break the moment the checkout moved. A copy is inert.
+
+set -euo pipefail
+
+usage() { sed -n '2,/^$/p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; }
+[[ "${1:-}" =~ ^(-h|--help)$ ]] && { usage; exit 0; }
+
+here="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)"
+prefix="${1:-$HOME/bin}"
+
+[[ -d "$prefix" ]] || { echo "install: no such directory: $prefix" >&2; exit 2; }
+
+install -m 755 "$here/bin/dev-snapshot" "$prefix/dev-snapshot"
+install -d -m 755 "$prefix/dev-snapshot.d"
+install -m 644 "$here"/bin/dev-snapshot.d/*.rules "$prefix/dev-snapshot.d/"
+
+echo "installed dev-snapshot -> $prefix"
+
+case ":$PATH:" in
+  *":$prefix:"*) ;;
+  *) echo "note: $prefix is not on your PATH" >&2 ;;
+esac
+
+# Prove the install rather than announcing it. A command that resolves its own
+# directory has exactly one interesting failure mode -- it cannot find its
+# ruleset -- and that failure is silent until someone runs a real backup.
+"$prefix/dev-snapshot" --version
+SNAPSHOT_RULES_DEFAULT="$prefix/dev-snapshot.d/default.rules" \
+  "$prefix/dev-snapshot" rules --source "$here" >/dev/null \
+  || { echo "install: the installed copy cannot read its ruleset" >&2; exit 1; }
+echo "ruleset reachable from the installed copy"

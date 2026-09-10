@@ -1,0 +1,88 @@
+# dev-snapshot slim ruleset -- applied ON TOP of default.rules by --slim.
+#
+# Same format: kind <TAB> name <TAB> guard <TAB> why
+#
+# A slim snapshot is the material you wrote, and nothing that merely
+# accumulated around it: no history, no logs, no archives, no binaries, no
+# media. It is deliberately LOSSY, and it is not a substitute for a regular
+# snapshot -- it is the one small enough to take often, or to carry.
+#
+# --slim also applies a per-file size cap (10M by default, --max-file-size to
+# change it), because the categories below cannot name every large thing. Both
+# the rules and the cap record what they dropped in the archive's manifest.
+
+# --- history --------------------------------------------------------------
+# The single biggest item, and the most deliberate omission: 2.7 GB on the
+# tree this was written for. A regular snapshot exists to carry it. Never let
+# a slim snapshot be the only copy of a repository with no remote.
+dir	.git	-	repository history
+dir	.hg	-	repository history
+dir	.svn	-	repository history
+
+# --- logs and dumps -------------------------------------------------------
+dir	logs	-	log directory
+dir	log	-	log directory
+file	*.log	-	log file
+file	*.log.[0-9]	-	rotated log
+file	*.out	-	captured output
+file	core.[0-9]*	-	core dump
+file	*.sql	-	database dump
+file	*.dump	-	database dump
+file	*.sqlite	-	embedded database
+file	*.sqlite3	-	embedded database
+file	*.db	-	embedded database
+
+# --- archives -------------------------------------------------------------
+file	*.tar	-	archive
+file	*.tar.*	-	archive
+file	*.tgz	-	archive
+file	*.zip	-	archive
+file	*.gz	-	archive
+file	*.bz2	-	archive
+file	*.xz	-	archive
+file	*.zst	-	archive
+file	*.7z	-	archive
+file	*.rar	-	archive
+file	*.jar	-	java archive
+file	*.war	-	java archive
+file	*.whl	-	python wheel
+file	*.phar	-	php archive
+file	*.gpg	-	encrypted blob
+
+# --- built and downloaded binaries ----------------------------------------
+file	*.so	-	shared object
+file	*.so.[0-9]*	-	shared object
+file	*.dylib	-	shared object
+file	*.dll	-	shared object
+file	*.a	-	static library
+file	*.o	-	object file
+file	*.class	-	compiled java
+file	*.exe	-	executable
+file	*.AppImage	-	bundled application
+file	*.deb	-	package
+file	*.rpm	-	package
+file	*.iso	-	disk image
+file	*.img	-	disk image
+file	*.dmg	-	disk image
+
+# --- media ----------------------------------------------------------------
+# Images are kept: a diagram, a screenshot in a README and a logo are material.
+# Video and audio are not, and are never small.
+file	*.mp4	-	video
+file	*.mov	-	video
+file	*.avi	-	video
+file	*.mkv	-	video
+file	*.webm	-	video
+file	*.mp3	-	audio
+file	*.wav	-	audio
+file	*.flac	-	audio
+file	*.psd	-	large source image
+file	*.mmdb	-	geoip database
+
+# --- deliberately NOT here ------------------------------------------------
+#
+# *.csv     A CSV is usually data somebody produced, and the size cap catches
+#           the exports without dropping a small lookup table that is source.
+# *.pdf     A document. That is what a slim snapshot is for.
+# *.png     A diagram or a screenshot in a README is material.
+# .env      Still the least replaceable file in most trees.

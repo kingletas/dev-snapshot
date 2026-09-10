@@ -1,0 +1,12 @@
+# A user-level excludes file can ignore *.sh, which would drop this project's own source.
+!*.sh
+!*.rules
+
+*.tar.zst
+*.tar.gz
+*.tar.xz
+*.gpg
+*.sha256
+
+# Disposable output: build products, screenshots, scratch notes. Never committed.
+local.d/

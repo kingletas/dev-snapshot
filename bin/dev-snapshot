@@ -1,0 +1,1208 @@
+#!/usr/bin/env bash
+#
+# dev-snapshot -- one encrypted archive of a source tree, minus the parts a
+# package manager can rebuild.
+#
+# Usage:
+#   dev-snapshot create [-n] [-y] [OPTIONS]   build, encrypt and file a snapshot
+#   dev-snapshot rules [--source DIR]         what the ruleset excludes, with sizes
+#   dev-snapshot rules add NAME [OPTIONS]     add a rule to your own ruleset
+#   dev-snapshot list                         snapshots at the destination
+#   dev-snapshot verify FILE                  decrypt and read it back end to end
+#   dev-snapshot restore FILE DIR [-n]        unpack a snapshot
+#   dev-snapshot prune --keep N [-n] [-y]     delete all but the newest N
+#   dev-snapshot self-test                    check the logic on a fixture tree
+#   dev-snapshot --version
+#
+# Options for `create`:
+#   -n, --dry-run          print the plan and the numbers, write nothing
+#   -y, --yes              do not prompt (for cron and other unattended runs)
+#   --source DIR           tree to snapshot          (no default; must be set)
+#   --dest DIR             where the archive lands   (no default; must be set)
+#   --label NAME           name inside the filename  (default: source basename)
+#   --recipient KEY        encrypt to a GPG public key (asymmetric, no passphrase)
+#   --symmetric            encrypt with a passphrase instead
+#   --passphrase-file F    read the passphrase from F rather than prompting
+#   --compress ALG         zstd | gzip | xz | none   (default: zstd)
+#   --level N              compression level         (default: 12 for zstd)
+#   --no-verify            skip the decrypt-and-read-back pass
+#   --no-rule NAME         drop one default rule for this run (repeatable)
+#   --keep N               prune to N snapshots after a successful run
+#   --slim                 documents only: no history, logs, archives or binaries,
+#                          plus a per-file size cap. Labelled separately, so a
+#                          slim snapshot never prunes a regular one.
+#   --max-file-size SIZE   skip files bigger than SIZE (10M, 500K, 2G). Implied
+#                          by --slim at 10M; every skipped file is recorded.
+#
+# Options for `rules add`:
+#   --guard G              sibling:FILE, has:FILE, or - for none
+#   --why TEXT             what a reader should understand the rule to mean
+#   --kind dir|file        default: dir
+#   --file PATH            write to this ruleset instead of the user one
+#
+# Environment overrides, lowest precedence first: built-in < config file <
+# environment < flags.
+#   SNAPSHOT_CONFIG      config file    (default: ~/.config/dev-snapshot/config)
+#   SNAPSHOT_SOURCE      tree to snapshot
+#   SNAPSHOT_DEST        destination directory
+#   SNAPSHOT_RECIPIENT   GPG key id, fingerprint or uid
+#   SNAPSHOT_RULES       extra ruleset  (default: ~/.config/dev-snapshot/rules)
+#   SNAPSHOT_COMPRESS    zstd | gzip | xz | none
+#   SNAPSHOT_LEVEL       compression level
+#   SNAPSHOT_STATE       run logs       (default: ~/.local/state/dev-snapshot)
+#
+# Three decisions worth knowing before you change anything here:
+#
+# Symlinks are stored as symlinks and never followed. This is not a detail.
+# The tree this was written against holds `docker/tmp -> /tmp` and a symlink
+# pointing at an 11 GB sibling; `tar -h` would have pulled the entire system
+# temp directory into the archive and stored the sibling twice. There is no
+# flag to turn following on, on purpose.
+#
+# The hash is taken by reading the file back off the destination, not by
+# tapping the stream on its way past. Hashing the stream certifies bytes that
+# were computed, which is not the question -- the question is what landed on
+# the disk, and on a removable drive those are different questions.
+#
+# A partial archive is deleted, never kept. gpg will happily encrypt a
+# truncated tar stream and produce a file that decrypts perfectly and restores
+# half a tree. Every stage's exit status is checked through PIPESTATUS, and
+# anything short of a clean run takes the output file with it.
+
+set -euo pipefail
+
+VERSION="1.1.0"
+PROG="${0##*/}"
+
+# ---------------------------------------------------------------- plumbing --
+
+HERE="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+RULES_DEFAULT="${SNAPSHOT_RULES_DEFAULT:-$HERE/dev-snapshot.d/default.rules}"
+
+die()  { echo "$PROG: $*" >&2; exit 2; }
+
+snapshot_cleanup() {
+  if [[ "$SNAP_OK" -eq 0 && -n "$SNAP_PARTIAL" && -e "$SNAP_PARTIAL" ]]; then
+    rm -f -- "$SNAP_PARTIAL"
+    echo "$PROG: removed the incomplete archive $SNAP_PARTIAL" >&2
+  fi
+  [[ -n "$SNAP_WORK" ]] && rm -rf -- "$SNAP_WORK"
+  return 0
+}
+warn() { echo "$PROG: $*" >&2; }
+say()  { echo "$*"; }
+rule_line() { printf '%s\n' "------------------------------------------------------------------"; }
+
+usage() { sed -n '2,/^$/p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; }
+
+# Bytes to something a person can read. numfmt is coreutils and everywhere,
+# but a snapshot tool that dies because a formatter is missing is a bad trade.
+human() {
+  if command -v numfmt >/dev/null 2>&1; then
+    numfmt --to=iec --suffix=B --format='%.1f' "$1" 2>/dev/null || echo "${1}B"
+  else
+    echo "${1}B"
+  fi
+}
+
+need() { command -v "$1" >/dev/null 2>&1 || die "requires '$1', which is not on PATH"; }
+
+# 10M, 500K, 2G, or plain bytes -> bytes. Rejects anything else rather than
+# guessing: a size cap that silently reads as zero would exclude every file.
+parse_size() {
+  local in="$1" num unit
+  [[ "$in" =~ ^([0-9]+)([KkMmGg]?)[Bb]?$ ]] || die "not a size: '$in' (try 10M, 500K, 2G)"
+  num="${BASH_REMATCH[1]}"; unit="${BASH_REMATCH[2]}"
+  case "$unit" in
+    K|k) echo $(( num * 1024 )) ;;
+    M|m) echo $(( num * 1024 * 1024 )) ;;
+    G|g) echo $(( num * 1024 * 1024 * 1024 )) ;;
+    *)   echo "$num" ;;
+  esac
+}
+
+# ------------------------------------------------------------------ config --
+#
+# Parsed as data, never sourced. A config file that gets sourced is a config
+# file that can run commands, and this tool is pointed at a whole home
+# directory and holds a GPG recipient -- it is not the place to hand a text
+# file the shell. Keys are whitelisted; an unknown key is reported rather than
+# ignored, because a silently-dropped DEST is how a backup goes to the wrong
+# disk.
+
+CFG_SOURCE=""; CFG_DEST=""; CFG_RECIPIENT=""; CFG_COMPRESS=""; CFG_LEVEL=""
+CFG_LABEL=""; CFG_RULES=""; CFG_KEEP=""; CFG_SYMMETRIC=""
+
+load_config() {
+  local f="${SNAPSHOT_CONFIG:-$HOME/.config/dev-snapshot/config}"
+  [[ -f "$f" ]] || return 0
+  local line key val n=0
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    n=$((n + 1))
+    line="${line%%#*}"
+    line="${line#"${line%%[![:space:]]*}"}"
+    line="${line%"${line##*[![:space:]]}"}"
+    [[ -z "$line" ]] && continue
+    [[ "$line" == *=* ]] || { warn "$f:$n: not KEY=VALUE, ignored"; continue; }
+    key="${line%%=*}"; val="${line#*=}"
+    key="${key%"${key##*[![:space:]]}"}"
+    val="${val#"${val%%[![:space:]]*}"}"
+    # Strip one layer of matching quotes, so a path with spaces can be quoted.
+    if [[ ${#val} -ge 2 && ( ( ${val:0:1} == '"' && ${val: -1} == '"' ) || ( ${val:0:1} == "'" && ${val: -1} == "'" ) ) ]]; then
+      val="${val:1:${#val}-2}"
+    fi
+    case "$key" in
+      SOURCE)    CFG_SOURCE="$val" ;;
+      DEST)      CFG_DEST="$val" ;;
+      RECIPIENT) CFG_RECIPIENT="$val" ;;
+      COMPRESS)  CFG_COMPRESS="$val" ;;
+      LEVEL)     CFG_LEVEL="$val" ;;
+      LABEL)     CFG_LABEL="$val" ;;
+      RULES)     CFG_RULES="$val" ;;
+      KEEP)      CFG_KEEP="$val" ;;
+      SYMMETRIC) CFG_SYMMETRIC="$val" ;;
+      *)         warn "$f:$n: unknown key '$key', ignored" ;;
+    esac
+  done < "$f"
+}
+
+# ------------------------------------------------------------------- rules --
+#
+# Loaded into two parallel arrays keyed by directory name, plus a flat list of
+# tar patterns for the file rules. A name appearing twice ORs its guards.
+
+declare -A RULE_GUARD=()
+declare -A RULE_WHY=()
+declare -a FILE_PATTERNS=()
+declare -a FILE_WHY=()
+
+load_rules_file() {
+  local f="$1"
+  [[ -f "$f" ]] || return 0
+  local kind name guard why n=0
+  while IFS=$'\t' read -r kind name guard why || [[ -n "${kind:-}" ]]; do
+    n=$((n + 1))
+    [[ -z "${kind// }" || "${kind:0:1}" == "#" ]] && continue
+    [[ -n "${name:-}" ]] || { warn "$f:$n: no name, ignored"; continue; }
+    guard="${guard:--}"
+    why="${why:-}"
+    case "$kind" in
+      dir)
+        if [[ -n "${RULE_GUARD[$name]:-}" && "${RULE_GUARD[$name]}" != "-" && "$guard" != "-" ]]; then
+          RULE_GUARD[$name]="${RULE_GUARD[$name]}|$guard"
+        elif [[ "$guard" == "-" || -z "${RULE_GUARD[$name]:-}" ]]; then
+          # An unguarded rule beats a guarded one: it is the broader claim.
+          [[ "$guard" == "-" ]] && RULE_GUARD[$name]="-" || RULE_GUARD[$name]="$guard"
+        fi
+        RULE_WHY[$name]="$why"
+        ;;
+      file)
+        FILE_PATTERNS+=("$name"); FILE_WHY+=("$why")
+        ;;
+      *) warn "$f:$n: unknown kind '$kind', ignored" ;;
+    esac
+  done < "$f"
+}
+
+load_rules() {
+  local extra="${SNAPSHOT_RULES:-${CFG_RULES:-$HOME/.config/dev-snapshot/rules}}"
+  [[ -f "$RULES_DEFAULT" ]] || die "ruleset not found at $RULES_DEFAULT"
+  load_rules_file "$RULES_DEFAULT"
+  # Slim is layered between the shipped set and the user's, so a user rule can
+  # still override or extend it -- and so that dropping --slim leaves the
+  # regular ruleset exactly as it was.
+  if [[ "$OPT_SLIM" -eq 1 ]]; then
+    [[ -f "$SLIM_RULES_DEFAULT" ]] || die "slim ruleset not found at $SLIM_RULES_DEFAULT"
+    load_rules_file "$SLIM_RULES_DEFAULT"
+  fi
+  load_rules_file "$extra"
+  local dropped
+  for dropped in "${NO_RULES[@]:-}"; do
+    [[ -z "$dropped" ]] && continue
+    if [[ -n "${RULE_GUARD[$dropped]:-}" ]]; then
+      unset "RULE_GUARD[$dropped]" "RULE_WHY[$dropped]"
+      say "  rule dropped for this run: $dropped"
+    else
+      warn "--no-rule $dropped: no such rule"
+    fi
+  done
+}
+
+# Does a candidate directory satisfy its rule's guard?
+#
+# `-`          always.
+# sibling:F    F exists beside the candidate. This is what keeps a `vendor`
+#              full of cloned repositories out of the exclusion list while
+#              still catching the one next to a composer.json.
+# has:F        F exists inside the candidate. `pyvenv.cfg` is what makes a
+#              directory a virtualenv; the name `env` proves nothing.
+guard_passes() {
+  local dir="$1" guards="$2" parent one pattern
+  [[ "$guards" == "-" ]] && return 0
+  parent="$(dirname -- "$dir")"
+  local IFS='|'
+  for one in $guards; do
+    case "$one" in
+      sibling:*)
+        pattern="${one#sibling:}"
+        # A bare glob needs the shell to expand it; compgen keeps that from
+        # leaking into the surrounding scope and copes with no match.
+        if compgen -G "$parent/$pattern" >/dev/null 2>&1; then return 0; fi
+        ;;
+      has:*)
+        pattern="${one#has:}"
+        if compgen -G "$dir/$pattern" >/dev/null 2>&1; then return 0; fi
+        ;;
+      *) warn "unknown guard '$one', treated as never satisfied" ;;
+    esac
+  done
+  return 1
+}
+
+# -------------------------------------------------------------- exclusions --
+#
+# Three files come out of here, all relative to the source root:
+#   $EX_PATHS   exact directory paths, fed to tar with --no-wildcards
+#   $EX_GLOBS   filename patterns, fed to tar with --wildcards
+#   $EX_UNREAD  paths that could not be read
+#
+# The walk is deliberately NOT pruned at a candidate. A candidate whose guard
+# fails stays in the archive, and a node_modules nested inside it still has to
+# be found -- a pruning walk would never look. The full walk over 800,000
+# files costs well under a second; correctness is cheaper here than cleverness.
+
+EX_PATHS=""; EX_GLOBS=""; EX_UNREAD=""; EX_OVERSIZE=""
+EXCLUDED_COUNT=0; UNREADABLE_COUNT=0; OVERSIZE_BYTES=0
+declare -A EX_BY_RULE=()
+
+build_exclusions() {
+  local src="$1" work="$2"
+  EX_PATHS="$work/exclude-paths.txt"
+  EX_GLOBS="$work/exclude-globs.txt"
+  EX_UNREAD="$work/unreadable.txt"
+  EX_OVERSIZE="$work/oversize.txt"
+  local raw="$work/candidates.txt" accepted="$work/accepted.txt"
+
+  : > "$EX_PATHS"; : > "$EX_GLOBS"; : > "$EX_UNREAD"; : > "$EX_OVERSIZE"; : > "$accepted"
+
+  local name
+  for name in "${!RULE_GUARD[@]}"; do printf '%s\n' "$name"; done | sort > "$work/names.txt"
+
+  # One walk, names matched in awk rather than as a 40-clause find expression:
+  # the expression form hits argument limits as the ruleset grows, and this is
+  # the same number of stat calls either way.
+  ( cd -- "$src" && find . -xdev -depth -type d -print 2>/dev/null ) \
+    | awk -F/ 'NR==FNR { want[$0]=1; next } want[$NF] { print }' "$work/names.txt" - \
+    > "$raw" || true
+
+  local dir base guards
+  while IFS= read -r dir; do
+    [[ -z "$dir" ]] && continue
+    base="${dir##*/}"
+    guards="${RULE_GUARD[$base]:-}"
+    [[ -z "$guards" ]] && continue
+    if ( cd -- "$src" && guard_passes "$dir" "$guards" ); then
+      printf '%s\n' "${dir#./}" >> "$accepted"
+    fi
+  done < "$raw"
+
+  # Drop any accepted path that sits under another accepted path, so nothing
+  # is counted twice in the size report and tar is not handed redundant work.
+  # Sorted order puts a parent immediately before its children.
+  sort "$accepted" | awk '
+    prev != "" && index($0, prev "/") == 1 { next }
+    { prev = $0; print }
+  ' > "$EX_PATHS"
+  EXCLUDED_COUNT=$(wc -l < "$EX_PATHS" | tr -d ' ')
+
+  # Tally per rule from the DEDUPED list, not from the accepted candidates. A
+  # __pycache__ inside an excluded virtualenv is a candidate that never becomes
+  # its own exclusion, and counting it made the per-rule column add up to
+  # 5,232 against a total of 611 -- two true numbers that read as a bug.
+  local ex_base
+  while IFS= read -r ex_base; do
+    [[ -z "$ex_base" ]] && continue
+    ex_base="${ex_base##*/}"
+    EX_BY_RULE[$ex_base]=$(( ${EX_BY_RULE[$ex_base]:-0} + 1 ))
+  done < "$EX_PATHS"
+
+  local i
+  for (( i = 0; i < ${#FILE_PATTERNS[@]}; i++ )); do
+    printf '%s\n' "${FILE_PATTERNS[$i]}" >> "$EX_GLOBS"
+  done
+
+  # Unreadable paths are found and named rather than left for tar to trip on.
+  # tar exits 2 on a permission denied, which fails the whole run at whatever
+  # percent it had reached; excluding them up front turns a fatal surprise
+  # into a declared gap. They are still REPORTED -- a file that could not be
+  # backed up must never look like a file that was.
+  ( cd -- "$src" && find . -xdev \! -readable -print 2>/dev/null ) \
+    | sed 's|^\./||' > "$EX_UNREAD" || true
+  UNREADABLE_COUNT=$(wc -l < "$EX_UNREAD" | tr -d ' ')
+
+  # The size cap. Rules can name a category of large thing; they cannot name
+  # every large thing, and "nothing remotely large" is a claim about bytes.
+  # Files already inside an excluded directory are skipped, so the count is
+  # what the cap ITSELF removed rather than a number inflated by overlap.
+  if [[ "$MAXSIZE_BYTES" -gt 0 ]]; then
+    ( cd -- "$src" && find . -xdev -type f -size +"$MAXSIZE_BYTES"c -printf '%s\t%p\n' 2>/dev/null ) \
+      | sed 's|\t\./|\t|' > "$work/oversize-all.txt" || true
+    if [[ -s "$EX_PATHS" ]]; then
+      # Drop any oversized file that already sits inside an excluded directory,
+      # by rebuilding each of its ancestor paths and testing membership. Without
+      # this the cap reports bytes that some rule had already removed, and two
+      # honest numbers add up to more than the tree.
+      awk -F'\t' '
+        NR == FNR { excluded[$0] = 1; next }
+        {
+          n = split($2, part, "/"); acc = ""
+          for (i = 1; i < n; i++) {
+            acc = (i == 1) ? part[1] : acc "/" part[i]
+            if (acc in excluded) next
+          }
+          print
+        }' "$EX_PATHS" "$work/oversize-all.txt" > "$work/oversize-net.txt" || true
+    else
+      cp "$work/oversize-all.txt" "$work/oversize-net.txt"
+    fi
+    cut -f2- "$work/oversize-net.txt" > "$EX_OVERSIZE"
+    OVERSIZE_COUNT=$(wc -l < "$EX_OVERSIZE" | tr -d ' ')
+    OVERSIZE_BYTES=$(awk -F'\t' '{t+=$1} END{print t+0}' "$work/oversize-net.txt")
+  fi
+}
+
+# du over a path list, deduped, in bytes. Returns 0 for an empty list.
+size_of_list() {
+  local src="$1" list="$2" out
+  [[ -s "$list" ]] || { echo 0; return 0; }
+  out="$( cd -- "$src" && { tr '\n' '\0' < "$list" \
+      | du -c -s -b --files0-from=- 2>/dev/null || true; } | tail -1 | cut -f1 )"
+  [[ -n "$out" ]] || out=0
+  printf '%s\n' "$out"
+}
+
+# ------------------------------------------------------------ create --------
+
+# These three are read by the EXIT trap. They are script-scope on purpose: an
+# EXIT trap fires after the function frame has been unwound, so a trap written
+# against `local` variables expands to empty strings and removes nothing --
+# leaving behind precisely the half-written archive it exists to delete.
+SNAP_OK=0; SNAP_PARTIAL=""; SNAP_WORK=""
+
+CMD_DRY=0; CMD_YES=0; CMD_VERIFY=1
+OPT_SOURCE=""; OPT_DEST=""; OPT_LABEL=""; OPT_RECIPIENT=""; OPT_COMPRESS=""
+OPT_LEVEL=""; OPT_SYMMETRIC=0; OPT_PASSFILE=""; OPT_KEEP=""
+OPT_SLIM=0; OPT_MAXSIZE=""; OPT_GUARD=""; OPT_WHY=""; OPT_KIND="dir"; OPT_RULEFILE=""
+SLIM_RULES_DEFAULT="${SNAPSHOT_SLIM_RULES:-$HERE/dev-snapshot.d/slim.rules}"
+MAXSIZE_BYTES=0
+OVERSIZE_COUNT=0
+declare -a NO_RULES=()
+
+resolve_settings() {
+  load_config
+  SOURCE="${OPT_SOURCE:-${SNAPSHOT_SOURCE:-${CFG_SOURCE:-}}}"
+  DEST="${OPT_DEST:-${SNAPSHOT_DEST:-${CFG_DEST:-}}}"
+  RECIPIENT="${OPT_RECIPIENT:-${SNAPSHOT_RECIPIENT:-${CFG_RECIPIENT:-}}}"
+  COMPRESS="${OPT_COMPRESS:-${SNAPSHOT_COMPRESS:-${CFG_COMPRESS:-zstd}}}"
+  LEVEL="${OPT_LEVEL:-${SNAPSHOT_LEVEL:-${CFG_LEVEL:-}}}"
+  LABEL="${OPT_LABEL:-${CFG_LABEL:-}}"
+  KEEP="${OPT_KEEP:-${CFG_KEEP:-}}"
+  [[ "$OPT_SYMMETRIC" -eq 1 || "${CFG_SYMMETRIC:-}" == "true" ]] && SYMMETRIC=1 || SYMMETRIC=0
+
+  [[ -n "$SOURCE" ]] || die "no source. Set SOURCE in ${SNAPSHOT_CONFIG:-~/.config/dev-snapshot/config} or pass --source."
+  SOURCE="${SOURCE%/}"
+  [[ -d "$SOURCE" ]] || die "source is not a directory: $SOURCE"
+  SOURCE="$(cd -- "$SOURCE" && pwd -P)"
+  [[ "$SOURCE" == "/" ]] && die "refusing to snapshot /"
+
+  [[ -n "$LABEL" ]] || LABEL="$(basename -- "$SOURCE" | tr '[:upper:]' '[:lower:]')"
+  # A slim snapshot carries its own label, so it lands under its own filename
+  # and -- because prune is label-scoped -- can never delete a regular one.
+  # Taking slim snapshots often is the whole point; they must not consume the
+  # retention of the snapshots that hold the history.
+  if [[ "$OPT_SLIM" -eq 1 && "$LABEL" != *-slim ]]; then LABEL="$LABEL-slim"; fi
+
+  if [[ -n "$OPT_MAXSIZE" ]]; then
+    MAXSIZE_BYTES="$(parse_size "$OPT_MAXSIZE")"
+  elif [[ "$OPT_SLIM" -eq 1 ]]; then
+    MAXSIZE_BYTES="$(parse_size 10M)"
+  fi
+  [[ "$LABEL" =~ ^[A-Za-z0-9._-]+$ ]] || die "label may only hold letters, digits, dot, dash and underscore: $LABEL"
+
+  case "$COMPRESS" in
+    zstd) need zstd; COMP_EXT="tar.zst"; LEVEL="${LEVEL:-12}" ;;
+    gzip) COMP_EXT="tar.gz";  LEVEL="${LEVEL:-6}" ;;
+    xz)   need xz;   COMP_EXT="tar.xz";  LEVEL="${LEVEL:-6}" ;;
+    none) COMP_EXT="tar"; LEVEL="0" ;;
+    *)    die "unknown --compress '$COMPRESS' (zstd, gzip, xz or none)" ;;
+  esac
+  [[ "$LEVEL" =~ ^[0-9]+$ ]] || die "--level must be a number: $LEVEL"
+}
+
+compressor_cmd() {
+  case "$COMPRESS" in
+    zstd) printf '%s\0' zstd "-T0" "-$LEVEL" "-q" "-" ;;
+    gzip) if command -v pigz >/dev/null 2>&1; then printf '%s\0' pigz "-$LEVEL" "-"
+          else printf '%s\0' gzip "-$LEVEL" "-c"; fi ;;
+    xz)   printf '%s\0' xz "-T0" "-$LEVEL" "-c" ;;
+    none) printf '%s\0' cat ;;
+  esac
+}
+
+decompressor_for() {
+  case "$1" in
+    *.tar.zst.gpg|*.tar.zst) need zstd; echo "zstd -d -c" ;;
+    *.tar.gz.gpg|*.tgz.gpg|*.tar.gz|*.tgz) echo "gzip -d -c" ;;
+    *.tar.xz.gpg|*.tar.xz) need xz; echo "xz -d -c" ;;
+    *.tar.gpg|*.tar) echo "cat" ;;
+    *) return 1 ;;
+  esac
+}
+
+# Prove the encryption works before spending an hour building something that
+# cannot be encrypted. A missing key, an expired key and an untrusted key all
+# fail here in under a second instead of at the very end.
+preflight_gpg() {
+  need gpg
+  if [[ "$SYMMETRIC" -eq 1 ]]; then
+    [[ -z "$OPT_PASSFILE" || -r "$OPT_PASSFILE" ]] || die "cannot read passphrase file: $OPT_PASSFILE"
+    return 0
+  fi
+  [[ -n "$RECIPIENT" ]] || die "no recipient key. Set RECIPIENT in ${SNAPSHOT_CONFIG:-~/.config/dev-snapshot/config}, pass --recipient, or use --symmetric.
+Keys available here:
+$(gpg --list-keys --keyid-format=long 2>/dev/null | grep -E '^(pub|uid)' | sed 's/^/  /' || echo '  (none)')"
+  gpg --list-keys -- "$RECIPIENT" >/dev/null 2>&1 || die "no such GPG key: $RECIPIENT"
+  printf 'preflight' | gpg --batch --yes --quiet --encrypt --recipient "$RECIPIENT" \
+      --compress-algo none -o /dev/null 2>/dev/null \
+    || die "GPG will not encrypt to '$RECIPIENT'. The key may be expired or untrusted.
+Check with: gpg --list-keys --keyid-format=long $RECIPIENT"
+}
+
+gpg_encrypt_cmd() {
+  if [[ "$SYMMETRIC" -eq 1 ]]; then
+    if [[ -n "$OPT_PASSFILE" ]]; then
+      printf '%s\0' gpg --batch --yes --quiet --pinentry-mode loopback \
+        --passphrase-file "$OPT_PASSFILE" --symmetric --cipher-algo AES256 \
+        --compress-algo none -o -
+    else
+      # No --batch: gpg-agent prompts on the terminal and asks twice, which is
+      # the confirmation this tool would otherwise have to build itself.
+      # The passphrase never appears in argv, so it never appears in `ps`.
+      printf '%s\0' gpg --quiet --symmetric --cipher-algo AES256 --compress-algo none -o -
+    fi
+  else
+    # --compress-algo none because the stream is already compressed. Letting
+    # gpg run zlib over zstd output costs real time and gains nothing.
+    printf '%s\0' gpg --batch --yes --quiet --encrypt --recipient "$RECIPIENT" \
+      --compress-algo none -o -
+  fi
+}
+
+# Every read path -- verify, restore, the listing inside restore -n -- goes
+# through this. A symmetric snapshot that cannot be decrypted by the same
+# invocation that wrote it fails its own verify, which reads as a corrupt
+# archive rather than as a missing passphrase.
+gpg_decrypt() {
+  if [[ -n "$OPT_PASSFILE" ]]; then
+    gpg --batch --quiet --pinentry-mode loopback --passphrase-file "$OPT_PASSFILE" --decrypt "$@"
+  else
+    gpg --quiet --decrypt "$@"
+  fi
+}
+
+cmd_create() {
+  resolve_settings
+  need tar; need find; need du; need sha256sum
+  preflight_gpg
+
+  [[ -n "$DEST" ]] || die "no destination. Set DEST in ${SNAPSHOT_CONFIG:-~/.config/dev-snapshot/config} or pass --dest."
+  DEST="${DEST%/}"
+  [[ -d "$DEST" ]] || die "destination is not a directory: $DEST
+If this is a removable drive, it may simply not be mounted."
+  [[ -w "$DEST" ]] || die "destination is not writable: $DEST"
+
+  local work; work="$(mktemp -d)"
+  SNAP_WORK="$work"; trap 'snapshot_cleanup' EXIT INT TERM
+  local state="${SNAPSHOT_STATE:-$HOME/.local/state/dev-snapshot}"
+  mkdir -p "$state"
+
+  # A second run against the same destination would interleave two tar streams
+  # into two files and race on the prune. One at a time.
+  local lock="$state/lock"
+  exec 9>"$lock"
+  if command -v flock >/dev/null 2>&1; then
+    flock -n 9 || die "another $PROG run holds the lock ($lock)"
+  fi
+
+  say "$PROG $VERSION"
+  say "  source       $SOURCE"
+  say "  destination  $DEST"
+  if [[ "$SYMMETRIC" -eq 1 ]]; then say "  encryption   symmetric (AES256, passphrase)"
+  else say "  encryption   $RECIPIENT"; fi
+  say "  compression  $COMPRESS${LEVEL:+ level $LEVEL}"
+  if [[ "$OPT_SLIM" -eq 1 ]]; then
+    say "  mode         slim -- documents only, no history, logs, archives or binaries"
+  fi
+  if [[ "$MAXSIZE_BYTES" -gt 0 ]]; then
+    say "  size cap     $(human "$MAXSIZE_BYTES") per file"
+  fi
+  say ""
+  say "Scanning $SOURCE ..."
+
+  load_rules
+  build_exclusions "$SOURCE" "$work"
+
+  # du exits 1 when it meets a directory it cannot read, which every real tree
+  # eventually has. Inside an assignment that status propagates and `set -e`
+  # ends the run -- with the whole scan already paid for and nothing said. The
+  # partial total it prints is still the right number for a size estimate.
+  local total_bytes excluded_bytes included_bytes
+  total_bytes="$( { du -s -b -- "$SOURCE" 2>/dev/null || true; } | cut -f1)"
+  [[ -n "$total_bytes" ]] || total_bytes=0
+  excluded_bytes="$(size_of_list "$SOURCE" "$EX_PATHS")"
+  included_bytes=$(( total_bytes - excluded_bytes ))
+
+  say ""
+  say "  tree         $(human "$total_bytes")"
+  say "  excluded     $(human "$excluded_bytes")  in $EXCLUDED_COUNT directories"
+  if [[ "$OVERSIZE_COUNT" -gt 0 ]]; then
+    say "  over the cap $(human "$OVERSIZE_BYTES")  in $OVERSIZE_COUNT file(s)"
+    included_bytes=$(( included_bytes - OVERSIZE_BYTES ))
+  fi
+  say "  to archive   $(human "$included_bytes")"
+  if [[ "$UNREADABLE_COUNT" -gt 0 ]]; then
+    say ""
+    say "  !! $UNREADABLE_COUNT path(s) could not be read and are NOT in this snapshot."
+    say "     They are listed in the manifest inside the archive. To include them,"
+    say "     run this as a user that can read them."
+    # `sed file | head -5` is a trap under `set -e` with pipefail: once head has
+    # its five lines it exits, sed takes SIGPIPE, and the pipeline returns 141
+    # -- which ends the run before a single byte is archived. It is a RACE, so
+    # it hides: with few enough lines sed finishes into the 64 KB pipe buffer
+    # before head leaves and nothing happens. Every fixture here had one
+    # unreadable file; the real tree has 191, and the backup died at this line.
+    # Reading with head and formatting afterwards removes the upstream writer.
+    head -5 "$EX_UNREAD" | sed 's/^/       /'
+
+    [[ "$UNREADABLE_COUNT" -gt 5 ]] && say "       ... and $(( UNREADABLE_COUNT - 5 )) more"
+  fi
+
+  if [[ "$CMD_DRY" -eq 1 ]]; then
+    say ""
+    rule_line
+    say "Biggest exclusions:"
+    ( cd -- "$SOURCE" && { tr '\n' '\0' < "$EX_PATHS" | du -s -b --files0-from=- 2>/dev/null || true; } ) \
+      | sort -rn > "$work/by-size.txt"
+    while read -r b p; do
+      printf '  %10s  %s\n' "$(human "$b")" "$p"
+    done < <(head -12 "$work/by-size.txt")
+    if [[ "$OVERSIZE_COUNT" -gt 0 ]]; then
+      say ""
+      say "Biggest files over the $(human "$MAXSIZE_BYTES") cap:"
+      sort -rn "$work/oversize-net.txt" > "$work/oversize-ranked.txt"
+      while IFS=$'\t' read -r b p; do
+        printf '  %10s  %s\n' "$(human "$b")" "$p"
+      done < <(head -8 "$work/oversize-ranked.txt")
+      [[ "$OVERSIZE_COUNT" -gt 8 ]] && say "              ... and $(( OVERSIZE_COUNT - 8 )) more"
+    fi
+    say ""
+    say "By rule:"
+    for name in $(printf '%s\n' "${!EX_BY_RULE[@]}" | sort); do
+      printf '  %-22s %5d dir(s)   %s\n' "$name" "${EX_BY_RULE[$name]}" "${RULE_WHY[$name]:-}"
+    done
+    say ""
+    say "Would write: $DEST/$(snapshot_name)"
+    return 0
+  fi
+
+  local name; name="$(snapshot_name)"
+  local out="$DEST/$name" partial="$DEST/.$name.partial"
+
+  # Reserve the FULL uncompressed size, because the compression ratio cannot be
+  # predicted and the honest floor is 1:1.
+  #
+  # This was half the raw size until it was measured. A 2.4 GB source-heavy
+  # subtree compressed 5.8x, which made half look like a wide margin; the real
+  # 13.3 GB tree compressed 2.1x to 6.4 GB, because 2.9 GB of it is .git pack
+  # files that are already deflated and a tree of media compresses at all only
+  # by accident. Half would have left 4% of headroom on a check whose whole job
+  # is to refuse before spending an hour.
+  local avail_kb need_kb
+  avail_kb="$(df -Pk -- "$DEST" | tail -1 | awk '{print $4}')"
+  need_kb=$(( included_bytes / 1024 ))
+  if [[ "$avail_kb" -lt "$need_kb" ]]; then
+    die "destination has $(human $(( avail_kb * 1024 ))) free.
+This run reserves $(human $(( need_kb * 1024 ))) -- the full uncompressed size, because a compression
+ratio cannot be predicted and 1:1 is the only floor that is always true. The
+finished file is usually much smaller: on the tree this was built for, 13.3GB
+compressed to 6.4GB.
+Free some space, or prune older snapshots with: $PROG prune --keep N"
+  fi
+
+  if [[ "$CMD_YES" -eq 0 ]] && [[ -t 0 ]]; then
+    say ""
+    # "Write 13.3GB to <file>" reads as a claim about the FILE, and the file is
+    # compressed -- so the number is off by several times in the alarming
+    # direction. Say what the number is a measure of, and do not invent a
+    # prediction for the one it is not: the ratio is a property of the tree.
+    say ""
+    say "  $(human "$included_bytes") of files will be archived into"
+    say "    $out"
+    say "  compressed and encrypted on the way, so the file itself will be smaller."
+    read -r -p "  Go ahead? [y/N] " reply
+    [[ "${reply,,}" =~ ^(y|yes)$ ]] || die "cancelled"
+  fi
+
+  write_manifest "$work/SNAPSHOT-MANIFEST.txt" "$total_bytes" "$excluded_bytes" "$included_bytes"
+
+  # Anything short of a clean run takes the partial file with it. An encrypted
+  # truncated tar decrypts perfectly and restores half a tree, which is the
+  # worst outcome available: a backup that looks fine and is not.
+  SNAP_PARTIAL="$partial"; SNAP_WORK="$work"
+  trap 'snapshot_cleanup' EXIT INT TERM
+
+  say ""
+  say "Archiving ..."
+
+  local -a comp_cmd gpg_cmd
+  mapfile -d '' -t comp_cmd < <(compressor_cmd)
+  mapfile -d '' -t gpg_cmd  < <(gpg_encrypt_cmd)
+
+  local index="$work/index.txt" tarerr="$work/tar.err"
+  local src_parent src_base
+  src_parent="$(dirname -- "$SOURCE")"
+  src_base="$(basename -- "$SOURCE")"
+
+  # tar's exclusion paths are matched against the member name, and members are
+  # prefixed with the source's own basename -- so the relative paths collected
+  # above have to be rewritten to match. Getting this wrong excludes nothing
+  # and reports success, so it is checked by the test suite.
+  # Unreadable paths join the exclusion list rather than being left for tar to
+  # meet. Without --ignore-failed-read a single one exits 2 and fails the whole
+  # run; with it they become warnings that scroll past. Excluding them up front
+  # makes the gap a line in the manifest instead of either of those.
+  { cat "$EX_PATHS"; cat "$EX_UNREAD"; cat "$EX_OVERSIZE"; } \
+    | sed "s|^|$src_base/|" > "$work/tar-excludes.txt"
+
+  set +e
+  tar --create --file - \
+      --sparse \
+      --ignore-failed-read \
+      --index-file="$index" --verbose \
+      --no-wildcards --anchored --exclude-from="$work/tar-excludes.txt" \
+      --wildcards --no-anchored --exclude-from="$EX_GLOBS" \
+      -C "$work" ./SNAPSHOT-MANIFEST.txt \
+      -C "$src_parent" -- "$src_base" 2>"$tarerr" \
+    | "${comp_cmd[@]}" \
+    | "${gpg_cmd[@]}" > "$partial"
+  local st=("${PIPESTATUS[@]}")
+  set -e
+
+  local tar_status="${st[0]}" comp_status="${st[1]}" gpg_status="${st[2]}"
+
+  # tar's exit codes carry the whole difference between "a file vanished while
+  # we read it" and "the archive is wrong". 1 is warnings, 2 is fatal.
+  if [[ "$tar_status" -eq 2 ]]; then
+    say ""; head -20 "$tarerr" | sed 's/^/  /' 
+    die "tar failed; $partial removed and nothing was written"
+  fi
+  [[ "$comp_status" -eq 0 ]] || die "$COMPRESS failed (exit $comp_status); $partial removed"
+  [[ "$gpg_status"  -eq 0 ]] || die "gpg failed (exit $gpg_status); $partial removed"
+
+  local warn_count=0
+  if [[ -s "$tarerr" ]]; then warn_count="$(wc -l < "$tarerr" | tr -d ' ')"; fi
+
+  local members; members="$(wc -l < "$index" | tr -d ' ')"
+  local written; written="$(stat -c %s -- "$partial" 2>/dev/null || stat -f %z -- "$partial")"
+
+  mv -- "$partial" "$out"
+  SNAP_OK=1; SNAP_PARTIAL=""
+
+  say "  $members members, $(human "$written") written"
+
+  # Hash what landed, by reading it back. On a removable drive the bytes that
+  # were computed and the bytes that are on the disk are different questions,
+  # and only the second one matters at restore time.
+  say "Hashing $out ..."
+  local digest; digest="$(sha256sum -- "$out" | cut -d' ' -f1)"
+
+  write_sidecar "$out" "$digest" "$members" "$written" "$total_bytes" \
+                "$excluded_bytes" "$included_bytes" "$warn_count"
+
+  # Keep the file list locally, never beside the archive. A plaintext index of
+  # every path next to an encrypted blob gives away most of what the encryption
+  # was protecting; on this machine the paths are already here anyway.
+  local logdir="$state/runs"; mkdir -p "$logdir"
+  gzip -c "$index" > "$logdir/${name%%.*}-index.txt.gz" 2>/dev/null || true
+  cp "$tarerr" "$logdir/${name%%.*}-warnings.txt" 2>/dev/null || true
+
+  say ""
+  rule_line
+  say "  $out"
+  say "  sha256  $digest"
+  if [[ "$warn_count" -gt 0 ]]; then
+    say ""
+    say "  $warn_count tar warning(s) -- usually a file that changed or vanished mid-run."
+    say "  Recorded in $logdir/${name%%.*}-warnings.txt"
+    head -5 "$tarerr" | sed 's/^/    /' 
+  fi
+  if [[ "$UNREADABLE_COUNT" -gt 0 ]]; then
+    say ""
+    say "  $UNREADABLE_COUNT unreadable path(s) are NOT in this snapshot. See the manifest inside it."
+  fi
+  if [[ "$OPT_SLIM" -eq 1 ]]; then
+    say ""
+    say "  SLIM: this snapshot holds no repository history, no logs, no archives"
+    say "  and no file over $(human "$MAXSIZE_BYTES"). $OVERSIZE_COUNT file(s) were dropped by the cap."
+    say "  It is not a substitute for a regular snapshot. Take one of those too:"
+    say "    $PROG create"
+  fi
+
+  if [[ "$CMD_VERIFY" -eq 1 ]]; then
+    say ""
+    verify_file "$out" "$members"
+  else
+    say ""
+    say "  NOT VERIFIED (--no-verify). Prove it restores with:"
+    say "    $PROG verify \"$out\""
+  fi
+
+  if [[ -n "$KEEP" ]]; then
+    say ""
+    prune_to "$KEEP"
+  fi
+}
+
+snapshot_name() {
+  local stamp base
+  stamp="$(date +%Y%m%d)"
+  base="$stamp-$LABEL.$COMP_EXT.gpg"
+  # Two runs on one day must not collide, and must not overwrite. The second
+  # gets the time as well rather than clobbering the first.
+  if [[ -e "$DEST/$base" ]]; then
+    base="$stamp-$(date +%H%M%S)-$LABEL.$COMP_EXT.gpg"
+  fi
+  printf '%s\n' "$base"
+}
+
+write_manifest() {
+  local f="$1" total="$2" excluded="$3" included="$4"
+  {
+    echo "dev-snapshot $VERSION"
+    echo "created            $(date -Iseconds)"
+    echo "host               $(uname -n)"
+    echo "source             $SOURCE"
+    echo "label              $LABEL"
+    echo "compression        $COMPRESS level $LEVEL"
+    if [[ "$OPT_SLIM" -eq 1 ]]; then
+      echo "mode               SLIM"
+      echo ""
+      echo "*** THIS IS A SLIM SNAPSHOT. It deliberately holds no repository"
+      echo "*** history, no logs, no archives, no binaries and no file over"
+      echo "*** $(human "$MAXSIZE_BYTES"). It is NOT a full backup of the source tree."
+    else
+      echo "mode               regular"
+    fi
+    [[ "$MAXSIZE_BYTES" -gt 0 ]] && echo "size cap           $MAXSIZE_BYTES bytes"
+    if [[ "$SYMMETRIC" -eq 1 ]]; then echo "encryption         symmetric AES256"
+    else echo "encryption         $RECIPIENT"; fi
+    echo "tree bytes         $total"
+    echo "excluded bytes     $excluded"
+    echo "archived bytes     $included"
+    echo "tar                $(tar --version 2>/dev/null | sed -n 1p)"
+    echo "gpg                $(gpg --version 2>/dev/null | sed -n 1p)"
+    echo ""
+    echo "Symlinks are stored as symlinks and were not followed."
+    echo ""
+    echo "=== EXCLUDED DIRECTORIES ($EXCLUDED_COUNT) ==="
+    cat "$EX_PATHS"
+    echo ""
+    echo "=== UNREADABLE, NOT IN THIS ARCHIVE ($UNREADABLE_COUNT) ==="
+    cat "$EX_UNREAD"
+    echo ""
+    echo "=== FILE PATTERNS EXCLUDED ==="
+    cat "$EX_GLOBS"
+    if [[ "$MAXSIZE_BYTES" -gt 0 ]]; then
+      echo ""
+      echo "=== DROPPED BY THE SIZE CAP ($OVERSIZE_COUNT files, $OVERSIZE_BYTES bytes) ==="
+      cat "$EX_OVERSIZE"
+    fi
+    echo ""
+    echo "=== TO RESTORE WITHOUT THIS TOOL ==="
+    case "$COMPRESS" in
+      zstd) echo "gpg --decrypt ARCHIVE | zstd -d | tar -xf - -C DESTINATION" ;;
+      gzip) echo "gpg --decrypt ARCHIVE | gzip -d | tar -xf - -C DESTINATION" ;;
+      xz)   echo "gpg --decrypt ARCHIVE | xz -d   | tar -xf - -C DESTINATION" ;;
+      none) echo "gpg --decrypt ARCHIVE | tar -xf - -C DESTINATION" ;;
+    esac
+  } > "$f"
+}
+
+write_sidecar() {
+  local out="$1" digest="$2" members="$3" written="$4"
+  local total="$5" excluded="$6" included="$7" warns="$8"
+  # Deliberately metadata only. A path listing here would undo the encryption
+  # for anyone who picked up the drive.
+  {
+    echo "$digest  $(basename -- "$out")"
+    echo "# dev-snapshot $VERSION"
+    echo "# created         $(date -Iseconds)"
+    echo "# source          $SOURCE"
+    echo "# members         $members"
+    echo "# archive bytes   $written"
+    echo "# tree bytes      $total"
+    echo "# excluded bytes  $excluded"
+    echo "# archived bytes  $included"
+    echo "# unreadable      $UNREADABLE_COUNT"
+    [[ "$OPT_SLIM" -eq 1 ]] && echo "# mode            SLIM -- not a full backup"
+    [[ "$MAXSIZE_BYTES" -gt 0 ]] && echo "# size cap        $MAXSIZE_BYTES bytes, $OVERSIZE_COUNT file(s) dropped"
+    echo "# tar warnings    $warns"
+    if [[ "$SYMMETRIC" -eq 1 ]]; then echo "# encryption      symmetric AES256"
+    else echo "# encryption      $RECIPIENT"; fi
+  } > "$out.sha256"
+}
+
+# ------------------------------------------------------------ verify --------
+
+verify_file() {
+  local f="$1" expect_members="${2:-}"
+  [[ -f "$f" ]] || die "no such snapshot: $f"
+  local dec; dec="$(decompressor_for "$f")" || die "cannot tell how '$f' is compressed"
+
+  if [[ -f "$f.sha256" ]]; then
+    say "Verifying checksum ..."
+    local want got
+    want="$(head -1 -- "$f.sha256" | cut -d' ' -f1)"
+    got="$(sha256sum -- "$f" | cut -d' ' -f1)"
+    if [[ "$want" == "$got" ]]; then say "  sha256 matches"
+    else die "SHA256 MISMATCH on $f
+  recorded $want
+  actual   $got
+This snapshot is damaged. Do not rely on it."; fi
+    [[ -z "$expect_members" ]] && expect_members="$(awk '/^# members/{print $3}' "$f.sha256")"
+  else
+    warn "no $f.sha256 beside the archive; checksum not verified"
+  fi
+
+  say "Reading the archive back ..."
+  # The only proof that matters: decrypt it, decompress it, and walk every
+  # member. A file that decrypts is not a file that restores.
+  # The pipeline must NOT run inside a command substitution: PIPESTATUS then
+  # describes the assignment, which is one command, and every stage's exit
+  # status is lost. That is exactly how a truncated archive passes a verify.
+  local count countfile; countfile="$(mktemp)"
+  set +e
+  gpg_decrypt -- "$f" 2>/dev/null | $dec 2>/dev/null | tar -tf - 2>/dev/null | wc -l > "$countfile"
+  local st=("${PIPESTATUS[@]}")
+  set -e
+  count="$(tr -d ' ' < "$countfile")"; rm -f -- "$countfile"
+  [[ "${st[0]}" -eq 0 ]] || die "gpg could not decrypt $f (exit ${st[0]}).
+For a key-encrypted snapshot the matching secret key must be in this keyring.
+For a passphrase-encrypted one, pass --passphrase-file."
+  [[ "${st[1]}" -eq 0 ]] || die "decompression failed on $f"
+  [[ "${st[2]}" -eq 0 ]] || die "tar could not read $f -- the archive is truncated or damaged"
+  [[ "${st[3]}" -eq 0 ]] || die "could not count members of $f"
+
+  say "  $count members read"
+  if [[ -n "$expect_members" && "$expect_members" != "$count" ]]; then
+    die "MEMBER COUNT MISMATCH: recorded $expect_members, read $count"
+  fi
+  say "  VERIFIED -- this snapshot decrypts and reads end to end."
+}
+
+# ------------------------------------------------------------ restore -------
+
+cmd_restore() {
+  local f="${1:-}" dir="${2:-}"
+  [[ -n "$f" && -n "$dir" ]] || die "usage: $PROG restore FILE DIR"
+  [[ -f "$f" ]] || die "no such snapshot: $f"
+  local dec; dec="$(decompressor_for "$f")" || die "cannot tell how '$f' is compressed"
+
+  if [[ "$CMD_DRY" -eq 1 ]]; then
+    say "Would restore $f into $dir. First 40 members:"
+    # The only place a SIGPIPE here is WANTED: listing 40 members of a 13 GB
+    # archive should stop after 40, not decrypt the whole thing. So the early
+    # exit is deliberate and the pipeline's status is deliberately not checked.
+    set +e
+    gpg_decrypt -- "$f" 2>/dev/null | $dec 2>/dev/null | tar -tf - 2>/dev/null | head -40 | sed 's/^/  /'
+    set -e
+    return 0
+  fi
+
+  mkdir -p -- "$dir"
+  if [[ -n "$(ls -A -- "$dir" 2>/dev/null)" && "$CMD_YES" -eq 0 ]]; then
+    [[ -t 0 ]] || die "$dir is not empty and there is no terminal to confirm on; pass -y"
+    read -r -p "$dir is not empty. Files there may be overwritten. Continue? [y/N] " reply
+    [[ "${reply,,}" =~ ^(y|yes)$ ]] || die "cancelled"
+  fi
+
+  say "Restoring $f into $dir ..."
+  set +e
+  gpg_decrypt -- "$f" | $dec | tar -xf - -C "$dir"
+  local st=("${PIPESTATUS[@]}")
+  set -e
+  [[ "${st[0]}" -eq 0 ]] || die "gpg could not decrypt $f"
+  [[ "${st[1]}" -eq 0 ]] || die "decompression failed"
+  [[ "${st[2]}" -eq 0 ]] || die "tar failed while extracting"
+  say "  restored into $dir"
+  # An archive written by an older tool -- or by hand -- has no manifest, and
+  # pointing at a file that is not there reads as a failed restore.
+  if [[ -f "$dir/SNAPSHOT-MANIFEST.txt" ]]; then
+    say ""
+    say "  Read $dir/SNAPSHOT-MANIFEST.txt for what was excluded and what could not be read."
+  fi
+}
+
+# ------------------------------------------------------------ list / prune --
+
+# Oldest first, by modification time rather than by name. A name sorts
+# lexically, and this tool's own collision suffix breaks that: the second run
+# on one day is called 20260826-183706-x and the first is 20260826-x, so a
+# lexical sort calls the NEWER file older and prune deletes the wrong one.
+#
+# The label filter is not cosmetic either. Two trees snapshotted to one
+# directory share it, and an unfiltered `prune --keep 2` run for one of them
+# silently deletes the other's history.
+snapshots_at() {
+  local d="$1" label="${2:-}"
+  local pattern='*.gpg'
+  [[ -n "$label" ]] && pattern="*-$label.*.gpg"
+  find "$d" -maxdepth 1 -type f -name "$pattern" -printf '%T@\t%f\n' 2>/dev/null \
+    | sort -n | cut -f2-
+}
+
+cmd_list() {
+  resolve_settings
+  [[ -n "$DEST" ]] || die "no destination configured"
+  [[ -d "$DEST" ]] || die "destination is not a directory: $DEST"
+  local n=0 f size when
+  say "$DEST"
+  while IFS= read -r f; do
+    [[ -z "$f" ]] && continue
+    n=$((n + 1))
+    size="$(stat -c %s -- "$DEST/$f" 2>/dev/null || echo 0)"
+    when="$(date -r "$DEST/$f" '+%Y-%m-%d %H:%M' 2>/dev/null || echo '?')"
+    printf '  %-42s %16s %10s  %s\n' "$f" "$when" "$(human "$size")" \
+      "$( [[ -f "$DEST/$f.sha256" ]] && echo 'sha256 recorded' || echo 'NO CHECKSUM' )"
+  done < <(snapshots_at "$DEST")
+  [[ "$n" -eq 0 ]] && say "  (no snapshots)"
+  return 0
+}
+
+prune_to() {
+  local keep="$1"
+  [[ "$keep" =~ ^[0-9]+$ ]] || die "--keep needs a number"
+  [[ "$keep" -ge 1 ]] || die "--keep must be at least 1; this tool will not delete every snapshot"
+  local -a all=()
+  mapfile -t all < <(snapshots_at "$DEST" "$LABEL")
+  local total="${#all[@]}"
+  if [[ "$total" -le "$keep" ]]; then
+    say "Prune: $total snapshot(s) labelled '$LABEL', keeping $keep -- nothing to remove."
+    return 0
+  fi
+  local -a doomed=("${all[@]:0:$(( total - keep ))}")
+  say "Prune: $total snapshot(s) labelled '$LABEL', keeping the newest $keep. Would remove:"
+  local f
+  for f in "${doomed[@]}"; do
+    printf '  %-46s %10s\n' "$f" "$(human "$(stat -c %s -- "$DEST/$f" 2>/dev/null || echo 0)")"
+  done
+  if [[ "$CMD_DRY" -eq 1 ]]; then say "  (dry run, nothing removed)"; return 0; fi
+  if [[ "$CMD_YES" -eq 0 ]]; then
+    [[ -t 0 ]] || die "no terminal to confirm on; pass -y to prune unattended"
+    read -r -p "Delete ${#doomed[@]} snapshot(s)? This cannot be undone. [y/N] " reply
+    [[ "${reply,,}" =~ ^(y|yes)$ ]] || { say "  cancelled"; return 0; }
+  fi
+  for f in "${doomed[@]}"; do
+    rm -f -- "$DEST/$f" "$DEST/$f.sha256"
+    say "  removed $f"
+  done
+}
+
+# ------------------------------------------------------------ rules ---------
+
+# `dev-snapshot rules add node_modules`
+# `dev-snapshot rules add vendor --guard sibling:composer.json --why "composer install"`
+#
+# Appends to the USER ruleset, never to the shipped one -- the shipped file is
+# replaced by the next install, and a rule written into it would vanish without
+# a word. Then it re-scans and says what the new rule actually matches here,
+# because a rule that matches nothing and a rule that is spelled wrong look
+# identical in a file.
+cmd_rules_add() {
+  local name="${1:-}"
+  [[ -n "$name" ]] || die "usage: $PROG rules add NAME [--guard G] [--why TEXT] [--kind dir|file]"
+
+  case "$OPT_KIND" in
+    dir|file) ;;
+    *) die "--kind must be dir or file, not '$OPT_KIND'" ;;
+  esac
+
+  # A tab would split the row into the wrong columns; a newline would end it.
+  [[ "$name" != *$'\t'* && "$name" != *$'\n'* ]] || die "a rule name cannot contain a tab or a newline"
+
+  local guard="${OPT_GUARD:--}"
+  local one
+  local IFS='|'
+  for one in $guard; do
+    case "$one" in
+      -|sibling:?*|has:?*) ;;
+      *) die "unknown guard '$one'. Use sibling:FILE, has:FILE, or - for none." ;;
+    esac
+  done
+  unset IFS
+  if [[ "$OPT_KIND" == "file" && "$guard" != "-" ]]; then
+    die "a file rule takes no guard: it becomes a tar pattern, so there is no directory to test."
+  fi
+
+  resolve_settings
+  local target="${OPT_RULEFILE:-${SNAPSHOT_RULES:-${CFG_RULES:-$HOME/.config/dev-snapshot/rules}}}"
+
+  if [[ -f "$target" ]] && awk -F'\t' -v n="$name" -v k="$OPT_KIND" \
+       '$1 == k && $2 == n { found = 1 } END { exit !found }' "$target"; then
+    die "'$name' is already a $OPT_KIND rule in $target"
+  fi
+  # A name already in the shipped set is a warning, not a refusal: an extra
+  # guard on an existing name is a real thing to want, and load_rules ORs them.
+  if awk -F'\t' -v n="$name" -v k="$OPT_KIND" \
+       '$1 == k && $2 == n { found = 1 } END { exit !found }' "$RULES_DEFAULT"; then
+    warn "'$name' is already in the shipped ruleset; this adds to it rather than replacing it"
+  fi
+
+  mkdir -p -- "$(dirname -- "$target")"
+  if [[ ! -f "$target" ]]; then
+    {
+      echo "# dev-snapshot -- rules for this machine, applied after the shipped set."
+      echo "#"
+      echo "# Tab-separated: kind <TAB> name <TAB> guard <TAB> why"
+      echo "# Guards: - always, sibling:FILE beside the candidate, has:FILE inside it."
+      echo ""
+    } > "$target"
+  fi
+  printf '%s\t%s\t%s\t%s\n' "$OPT_KIND" "$name" "$guard" "${OPT_WHY:-added by rules add}" >> "$target"
+  say "added to $target"
+  say "  $OPT_KIND  $name  $guard  ${OPT_WHY:-added by rules add}"
+
+  # Now prove it does something.
+  local work; work="$(mktemp -d)"; SNAP_WORK="$work"; trap 'snapshot_cleanup' EXIT INT TERM
+  load_rules
+  build_exclusions "$SOURCE" "$work"
+  local hits="${EX_BY_RULE[$name]:-0}"
+  say ""
+  if [[ "$OPT_KIND" == "file" ]]; then
+    say "  It is a file pattern, so tar applies it directly and there is nothing to count."
+  elif [[ "$hits" -eq 0 ]]; then
+    say "  It matches nothing under $SOURCE right now."
+    say "  That is fine for a rule you expect to need, and it is also what a"
+    say "  misspelled name or an unmet guard looks like. Check with:"
+    say "    find \"$SOURCE\" -type d -name \"$name\" | head"
+  else
+    say "  It matches $hits directory(ies) under $SOURCE:"
+    # awk on the last path component rather than a built regex: a rule name is
+    # user input, and escaping it into a pattern is a bug waiting to happen.
+    # The cap is applied inside awk so nothing feeds `head` -- see the SIGPIPE
+    # note above the exclusion list.
+    while IFS= read -r d; do printf '    %s\n' "$d"; done \
+      < <(awk -F/ -v n="$name" '$NF == n { c++; if (c <= 6) print }' "$EX_PATHS")
+    [[ "$hits" -gt 6 ]] && say "    ... and $(( hits - 6 )) more"
+    say ""
+    say "  See the whole picture with: $PROG create -n"
+  fi
+}
+
+cmd_rules() {
+  resolve_settings
+  load_rules
+  # Same trap-scope rule as cmd_create: an EXIT trap fires after the function
+  # frame is gone, so it must read script-scope state, not a `local`.
+  local work; work="$(mktemp -d)"; SNAP_WORK="$work"; trap 'snapshot_cleanup' EXIT INT TERM
+  say "Ruleset: $RULES_DEFAULT"
+  local extra="${SNAPSHOT_RULES:-${CFG_RULES:-$HOME/.config/dev-snapshot/rules}}"
+  if [[ -f "$extra" ]]; then say "         $extra"; else say "         (no user ruleset at $extra)"; fi
+  say ""
+  say "Scanning $SOURCE ..."
+  build_exclusions "$SOURCE" "$work"
+  local excluded_bytes; excluded_bytes="$(size_of_list "$SOURCE" "$EX_PATHS")"
+  say ""
+  printf '  %-22s %-7s %s\n' "RULE" "DIRS" "WHY"
+  local name
+  for name in $(printf '%s\n' "${!RULE_GUARD[@]}" | sort); do
+    printf '  %-22s %-7s %s\n' "$name" "${EX_BY_RULE[$name]:-0}" "${RULE_WHY[$name]:-}"
+  done
+  say ""
+  say "  $EXCLUDED_COUNT directories, $(human "$excluded_bytes") excluded"
+  say "  $UNREADABLE_COUNT path(s) unreadable and therefore not archivable"
+}
+
+# ------------------------------------------------------------ self-test -----
+
+cmd_self_test() {
+  # The suite lives in the repository, not in the installed copy. Saying so is
+  # better than a bare "no such file" from a command that looks like it should
+  # always work.
+  local suite="$HERE/../tests/run.sh"
+  [[ -x "$suite" ]] || die "no test suite beside this copy of $PROG.
+The tests ship with the repository: clone it and run tests/run.sh there."
+  exec "$suite"
+}
+
+# ------------------------------------------------------------ dispatch ------
+
+[[ $# -eq 0 ]] && { usage; exit 0; }
+
+case "${1:-}" in
+  -h|--help|help) usage; exit 0 ;;
+  --version) echo "$PROG $VERSION"; exit 0 ;;
+esac
+
+CMD="$1"; shift
+
+# Positional arguments are collected rather than terminating the parse. A user
+# writes `restore FILE DIR --passphrase-file P` at least as often as the other
+# order, and a parser that stops at the first non-flag silently drops the rest
+# -- here that meant a restore that could not decrypt, reported as a damaged
+# archive.
+declare -a POSITIONAL=()
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -n|--dry-run)      CMD_DRY=1 ;;
+    -y|--yes)          CMD_YES=1 ;;
+    --source)          OPT_SOURCE="${2:?--source needs a directory}"; shift ;;
+    --dest)            OPT_DEST="${2:?--dest needs a directory}"; shift ;;
+    --label)           OPT_LABEL="${2:?--label needs a name}"; shift ;;
+    --recipient)       OPT_RECIPIENT="${2:?--recipient needs a key}"; shift ;;
+    --symmetric)       OPT_SYMMETRIC=1 ;;
+    --passphrase-file) OPT_PASSFILE="${2:?--passphrase-file needs a path}"; shift ;;
+    --compress)        OPT_COMPRESS="${2:?--compress needs an algorithm}"; shift ;;
+    --level)           OPT_LEVEL="${2:?--level needs a number}"; shift ;;
+    --keep)            OPT_KEEP="${2:?--keep needs a number}"; shift ;;
+    --no-verify)       CMD_VERIFY=0 ;;
+    --no-rule)         NO_RULES+=("${2:?--no-rule needs a rule name}"); shift ;;
+    --slim)            OPT_SLIM=1 ;;
+    --max-file-size)   OPT_MAXSIZE="${2:?--max-file-size needs a size}"; shift ;;
+    --guard)           OPT_GUARD="${2:?--guard needs a value}"; shift ;;
+    --why)             OPT_WHY="${2:?--why needs text}"; shift ;;
+    --kind)            OPT_KIND="${2:?--kind needs dir or file}"; shift ;;
+    --file)            OPT_RULEFILE="${2:?--file needs a path}"; shift ;;
+    -h|--help)         usage; exit 0 ;;
+    --)                shift; POSITIONAL+=("$@"); break ;;
+    -*)                die "unknown option '$1'" ;;
+    *)                 POSITIONAL+=("$1") ;;
+  esac
+  shift
+done
+
+set -- ${POSITIONAL[@]+"${POSITIONAL[@]}"}
+
+case "$CMD" in
+  create)   cmd_create ;;
+  rules)    if [[ "${1:-}" == "add" ]]; then shift; cmd_rules_add "${1:-}"; else cmd_rules; fi ;;
+  list)     cmd_list ;;
+  verify)   [[ -n "${1:-}" ]] || die "usage: $PROG verify FILE"; verify_file "$1" ;;
+  restore)  cmd_restore "${1:-}" "${2:-}" ;;
+  prune)    resolve_settings
+            [[ -n "$DEST" ]] || die "no destination configured"
+            prune_to "${OPT_KEEP:?prune needs --keep N}" ;;
+  self-test) cmd_self_test ;;
+  *)        die "unknown command '$CMD' (try: $PROG --help)" ;;
+esac
