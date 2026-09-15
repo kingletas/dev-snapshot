@@ -6,6 +6,7 @@ All notable changes to this project are documented here. The format follows [Kee
 
 ### Changed
 
+- **`make check` fails when a linter is missing, instead of skipping it and passing anyway.** `make lint` printed `shellcheck  skipped (not installed)` and went on to report `lint and tests pass`, so on a machine without it the gate was green and nothing had read a line of shell. A linter that is not installed is a check that did not run, not a check that passed. The lane now names the linter, says it did not run, and says how to install it. `scripts/lint-tool` is the one place that decides this, and the suite asserts both directions with stand-ins so it does not itself depend on a linter being present.
 - **`--source` has no default and must be set.** It used to default to a directory on the author's machine. Set `SOURCE` in `~/.config/dev-snapshot/config`, set `SNAPSHOT_SOURCE`, or pass `--source`; with none of them, every command that reads the settings exits 2 and says `no source`.
 - **CI runs `make check`** on ubuntu-latest, where it used to restate the same steps on two Ubuntu versions.
 

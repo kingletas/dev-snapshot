@@ -11,7 +11,7 @@ git clone https://github.com/kingletas/dev-snapshot && cd dev-snapshot
 make check
 ```
 
-Nothing to install beyond `bash`, GNU `tar`, `gpg` and `zstd`, plus `shellcheck` if you are touching the shell — which you are. `make check` is the same gate CI runs: shellcheck, the ruleset validation and the test suite.
+Nothing to install beyond `bash`, GNU `tar`, `gpg`, `zstd` and `shellcheck`. `make check` is the same gate CI runs: shellcheck, the ruleset validation and the test suite. It fails rather than skipping when `shellcheck` is missing, because a linter that did not run is not a linter that passed.
 
 ## Four rules that outrank everything else
 

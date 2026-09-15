@@ -120,12 +120,7 @@ test: ## The end-to-end suite — no network, no key generation
 
 .PHONY: lint
 lint: ## shellcheck, and the ruleset's own guard validation
-	@printf '  %-14s ' "shellcheck"
-	@if command -v shellcheck >/dev/null 2>&1; then \
-		shellcheck bin/dev-snapshot tests/run.sh scripts/install packaging/release-notes.sh && echo "ok"; \
-	else \
-		echo "skipped (not installed)"; \
-	fi
+	@scripts/lint-tool shellcheck bin/dev-snapshot tests/run.sh scripts/install scripts/lint-tool packaging/release-notes.sh
 	@printf '  %-14s ' "rulesets"
 	@bad=0; for f in bin/dev-snapshot.d/*.rules; do \
 		while IFS=$$'\t' read -r kind name guard why; do \
