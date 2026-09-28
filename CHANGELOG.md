@@ -12,6 +12,8 @@ All notable changes to this project are documented here. The format follows [Kee
 
 ### Added
 
+- **`bundle`: one git bundle per repository, for the history a snapshot only catches weekly.** A repository with no remote gets its whole history; one with a remote gets only what no remote has, and none at all when everything is pushed. The names are stable and a bundle is rewritten only when that repository's refs change, so a file-level backup keeps one version per change. Each bundle is verified before it replaces the last. `BUNDLE_DEST` in the config, or `--dest`. `make bundle` runs it.
+- **`create --if-older-than DAYS`**, which does nothing unless the newest snapshot with the same label is at least that old, so a daily timer can hold a weekly or monthly cadence.
 - **A release workflow.** Pushing a tag such as `v1.2.0` checks that the tag matches `dev-snapshot --version`, runs `make check`, proves `make install` works, and publishes a GitHub Release whose body is that version's section of this file.
 
 ## [1.1.0]

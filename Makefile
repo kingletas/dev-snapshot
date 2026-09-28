@@ -44,6 +44,10 @@ regular: ## Full snapshot — everything but the rebuildable trees
 slim: ## Documents only — no history, logs, archives, binaries or large files
 	@$(DS) create --slim $(CONFIRM)
 
+.PHONY: bundle
+bundle: ## One git bundle per repository, rewritten only when its refs change
+	@$(DS) bundle
+
 .PHONY: plan
 plan: ## What a full snapshot would archive and drop, writing nothing
 	@$(DS) create -n

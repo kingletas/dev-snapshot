@@ -11,6 +11,9 @@
 #   dev-snapshot verify FILE                  decrypt and read it back end to end
 #   dev-snapshot restore FILE DIR [-n]        unpack a snapshot
 #   dev-snapshot prune --keep N [-n] [-y]     delete all but the newest N
+#   dev-snapshot bundle [-n] [--source DIR] [--dest DIR]
+#                                             one git bundle per repository, rewritten
+#                                             only when its refs change
 #   dev-snapshot self-test                    check the logic on a fixture tree
 #   dev-snapshot --version
 #
@@ -31,6 +34,8 @@
 #   --slim                 documents only: no history, logs, archives or binaries,
 #                          plus a per-file size cap. Labelled separately, so a
 #                          slim snapshot never prunes a regular one.
+#   --if-older-than DAYS   do nothing unless the newest snapshot with this label
+#                          is at least DAYS old, so a daily timer can run it
 #   --max-file-size SIZE   skip files bigger than SIZE (10M, 500K, 2G). Implied
 #                          by --slim at 10M; every skipped file is recorded.
 #
@@ -50,6 +55,7 @@
 #   SNAPSHOT_COMPRESS    zstd | gzip | xz | none
 #   SNAPSHOT_LEVEL       compression level
 #   SNAPSHOT_STATE       run logs       (default: ~/.local/state/dev-snapshot)
+#   SNAPSHOT_BUNDLE_DEST where `bundle` writes (config key BUNDLE_DEST)
 #
 # Three decisions worth knowing before you change anything here:
 #
@@ -131,7 +137,7 @@ parse_size() {
 # disk.
 
 CFG_SOURCE=""; CFG_DEST=""; CFG_RECIPIENT=""; CFG_COMPRESS=""; CFG_LEVEL=""
-CFG_LABEL=""; CFG_RULES=""; CFG_KEEP=""; CFG_SYMMETRIC=""
+CFG_LABEL=""; CFG_RULES=""; CFG_KEEP=""; CFG_SYMMETRIC=""; CFG_BUNDLE_DEST=""
 
 load_config() {
   local f="${SNAPSHOT_CONFIG:-$HOME/.config/dev-snapshot/config}"
@@ -161,6 +167,7 @@ load_config() {
       RULES)     CFG_RULES="$val" ;;
       KEEP)      CFG_KEEP="$val" ;;
       SYMMETRIC) CFG_SYMMETRIC="$val" ;;
+      BUNDLE_DEST) CFG_BUNDLE_DEST="$val" ;;
       *)         warn "$f:$n: unknown key '$key', ignored" ;;
     esac
   done < "$f"
@@ -392,7 +399,7 @@ SNAP_OK=0; SNAP_PARTIAL=""; SNAP_WORK=""
 CMD_DRY=0; CMD_YES=0; CMD_VERIFY=1
 OPT_SOURCE=""; OPT_DEST=""; OPT_LABEL=""; OPT_RECIPIENT=""; OPT_COMPRESS=""
 OPT_LEVEL=""; OPT_SYMMETRIC=0; OPT_PASSFILE=""; OPT_KEEP=""
-OPT_SLIM=0; OPT_MAXSIZE=""; OPT_GUARD=""; OPT_WHY=""; OPT_KIND="dir"; OPT_RULEFILE=""
+OPT_SLIM=0; OPT_IF_OLDER=""; OPT_MAXSIZE=""; OPT_GUARD=""; OPT_WHY=""; OPT_KIND="dir"; OPT_RULEFILE=""
 SLIM_RULES_DEFAULT="${SNAPSHOT_SLIM_RULES:-$HERE/dev-snapshot.d/slim.rules}"
 MAXSIZE_BYTES=0
 OVERSIZE_COUNT=0
@@ -520,6 +527,19 @@ cmd_create() {
   [[ -d "$DEST" ]] || die "destination is not a directory: $DEST
 If this is a removable drive, it may simply not be mounted."
   [[ -w "$DEST" ]] || die "destination is not writable: $DEST"
+
+  if [[ -n "$OPT_IF_OLDER" ]]; then
+    [[ "$OPT_IF_OLDER" =~ ^[0-9]+$ ]] || die "--if-older-than needs a whole number of days"
+    local newest age
+    newest="$(snapshots_at "$DEST" "$LABEL" | tail -n1)"
+    if [[ -n "$newest" ]]; then
+      age=$(( ( $(date +%s) - $(stat -c %Y -- "$DEST/$newest") ) / 86400 ))
+      if [[ "$age" -lt "$OPT_IF_OLDER" ]]; then
+        say "Not due: the newest '$LABEL' snapshot, $newest, is $age day(s) old."
+        return 0
+      fi
+    fi
+  fi
 
   local work; work="$(mktemp -d)"
   SNAP_WORK="$work"; trap 'snapshot_cleanup' EXIT INT TERM
@@ -1018,6 +1038,91 @@ prune_to() {
   done
 }
 
+# ----------------------------------------------------------- bundles --------
+#
+# A snapshot is a copy of the tree on the day it was taken. A repository's
+# history is a different thing: in a repository with no remote, its .git is the
+# only copy there is. `bundle` writes one git bundle per repository under the
+# source, for a file-level backup (Deja Dup, restic, rsync) to carry.
+#
+# A repository with no remote gets its whole history, and restores with a plain
+# `git clone`. One with a remote gets only what no remote has; that bundle
+# needs the remote's history to restore, so it is fetched into a fresh clone.
+# Nothing unpushed means no bundle, and a bundle left from before is removed.
+#
+# Each bundle has a stable name taken from the repository's path, and is
+# rewritten only when the repository's refs changed. A backup tool that
+# versions files then keeps one version per change and sees nothing on a quiet
+# day. Refs are fingerprinted in the state directory, never beside the bundles.
+
+bundle_name() {
+  # Docker/shop/web -> Docker__shop__web.bundle. The path is the identity, so two
+  # repositories with the same basename cannot share a file.
+  local rel="$1"
+  printf '%s.bundle\n' "${rel//\//__}"
+}
+
+refs_fingerprint() {
+  # Every ref, remote-tracking ones included, since they decide what is unpushed.
+  git -C "$1" for-each-ref --format='%(objectname) %(refname)' | sha256sum | cut -d' ' -f1
+}
+
+cmd_bundle() {
+  resolve_settings
+  # Bundles have their own destination, so they never land among the snapshots.
+  DEST="${OPT_DEST:-${SNAPSHOT_BUNDLE_DEST:-${CFG_BUNDLE_DEST:-}}}"
+  [[ -n "$DEST" ]] || die "no bundle destination. Set BUNDLE_DEST in the config or pass --dest."
+  need git
+  local state="${SNAPSHOT_STATE:-$HOME/.local/state/dev-snapshot}/bundles"
+  if [[ "$CMD_DRY" -eq 0 ]]; then mkdir -p -- "$DEST" "$state"; fi
+  local written=0 same=0 removed=0 skipped=0
+  local gitdir repo rel name fp remotes kind tmp
+  while IFS= read -r -d '' gitdir; do
+    repo="${gitdir%/.git}"
+    rel="${repo#"$SOURCE"/}"
+    [[ "$repo" == "$SOURCE" ]] && rel="$(basename -- "$SOURCE")"
+    name="$(bundle_name "$rel")"
+    remotes="$(git -C "$repo" remote 2>/dev/null || true)"
+    if ! git -C "$repo" rev-parse -q --verify HEAD >/dev/null 2>&1 \
+        && [[ -z "$(git -C "$repo" for-each-ref --count=1)" ]]; then
+      skipped=$((skipped + 1)); continue   # an empty repository has no history to keep
+    fi
+    if [[ -z "$remotes" ]]; then
+      kind="whole history"
+    elif [[ -z "$(git -C "$repo" rev-list -n1 --all --not --remotes 2>/dev/null)" ]]; then
+      if [[ -e "$DEST/$name" ]]; then
+        say "  removed   $name (everything is on a remote now)"
+        [[ "$CMD_DRY" -eq 1 ]] || rm -f -- "$DEST/$name" "$state/$name.refs"
+        removed=$((removed + 1))
+      fi
+      continue
+    else
+      kind="unpushed only"
+    fi
+    fp="$(refs_fingerprint "$repo")"
+    if [[ -f "$DEST/$name" && "$(cat -- "$state/$name.refs" 2>/dev/null)" == "$fp" ]]; then
+      same=$((same + 1)); continue
+    fi
+    say "  bundle    $name ($kind)"
+    written=$((written + 1))
+    [[ "$CMD_DRY" -eq 1 ]] && continue
+    tmp="$DEST/.$name.partial"
+    if [[ -z "$remotes" ]]; then
+      git -C "$repo" bundle create -q "$tmp" --all
+    else
+      git -C "$repo" bundle create -q "$tmp" --all --not --remotes
+    fi
+    # Verified in the repository, where a thin bundle's prerequisites exist.
+    if ! git -C "$repo" bundle verify -q "$tmp" >/dev/null 2>&1; then
+      rm -f -- "$tmp"; die "bundle for $rel did not verify; nothing replaced"
+    fi
+    mv -f -- "$tmp" "$DEST/$name"
+    printf '%s\n' "$fp" > "$state/$name.refs"
+  done < <(find "$SOURCE" \( -name node_modules -o -name .venv \) -prune \
+             -o -name .git -type d -prune -print0 2>/dev/null | sort -z)
+  say "Bundles: $written written, $same unchanged, $removed removed, $skipped empty.$([[ "$CMD_DRY" -eq 1 ]] && echo ' (dry run, nothing written)')"
+}
+
 # ------------------------------------------------------------ rules ---------
 
 # `dev-snapshot rules add node_modules`
@@ -1179,6 +1284,7 @@ while [[ $# -gt 0 ]]; do
     --no-verify)       CMD_VERIFY=0 ;;
     --no-rule)         NO_RULES+=("${2:?--no-rule needs a rule name}"); shift ;;
     --slim)            OPT_SLIM=1 ;;
+    --if-older-than)   OPT_IF_OLDER="${2:?--if-older-than needs a number of days}"; shift ;;
     --max-file-size)   OPT_MAXSIZE="${2:?--max-file-size needs a size}"; shift ;;
     --guard)           OPT_GUARD="${2:?--guard needs a value}"; shift ;;
     --why)             OPT_WHY="${2:?--why needs text}"; shift ;;
@@ -1200,6 +1306,7 @@ case "$CMD" in
   list)     cmd_list ;;
   verify)   [[ -n "${1:-}" ]] || die "usage: $PROG verify FILE"; verify_file "$1" ;;
   restore)  cmd_restore "${1:-}" "${2:-}" ;;
+  bundle)   cmd_bundle ;;
   prune)    resolve_settings
             [[ -n "$DEST" ]] || die "no destination configured"
             prune_to "${OPT_KEEP:?prune needs --keep N}" ;;

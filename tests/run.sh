@@ -14,6 +14,12 @@
 
 set -uo pipefail
 
+# Run from a git hook (a pre-commit gate, say), git has set GIT_DIR and
+# GIT_INDEX_FILE to the repository being committed, and every `git -C fixture`
+# below would act on that repository instead: commit to it, re-initialise it,
+# and push its branch to its real remote. Clear them before any git runs.
+while IFS= read -r var; do unset "$var"; done < <(git rev-parse --local-env-vars 2>/dev/null)
+
 HERE="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)"
 DS="$HERE/bin/dev-snapshot"
 passed=0
@@ -509,6 +515,92 @@ PATH="/usr/bin:/bin" "$LINT_TOOL" ruff check . >/dev/null 2>&1
 check "ruff with no uv either is a failure, not a skip" "$?" "1"
 
 rm -rf "$lintbin"
+
+# ---------------------------------------------------------- if-older-than --
+echo
+echo "create --if-older-than"
+
+due="$work/dest-due"; mkdir -p "$due"
+touch "$due/20260101-proj.tar.zst.gpg"
+out=$("$DS" create -n --label proj --if-older-than 7 --source "$SRC" --dest "$due" --symmetric --passphrase-file "$PASS" 2>&1); status=$?
+check "a fresh snapshot makes the run a no-op" "$status" "0"
+want_grep "Not due" "$out" "and it says so"
+check "and nothing new lands" "$(find "$due" -type f | wc -l)" "1"
+
+out=$("$DS" create -n --label other --if-older-than 7 --source "$SRC" --dest "$due" --symmetric --passphrase-file "$PASS" 2>&1)
+want_no_grep "Not due" "$out" "another label's snapshot does not count"
+
+touch -d '8 days ago' "$due/20260101-proj.tar.zst.gpg"
+out=$("$DS" create -n --label proj --if-older-than 7 --source "$SRC" --dest "$due" --symmetric --passphrase-file "$PASS" 2>&1)
+want_no_grep "Not due" "$out" "a snapshot older than the interval makes it due"
+
+out=$("$DS" create -n --label proj --if-older-than soon --source "$SRC" --dest "$due" --symmetric --passphrase-file "$PASS" 2>&1); status=$?
+check "a non-number is refused" "$status" "2"
+
+# ------------------------------------------------------------------ bundle --
+echo
+echo "bundle"
+
+export GIT_AUTHOR_NAME="Test Author" GIT_AUTHOR_EMAIL="author@example.test"
+export GIT_COMMITTER_NAME="Test Author" GIT_COMMITTER_EMAIL="author@example.test"
+bsrc="$work/bundle-src"; bdest="$work/bundle-dest"; bup="$work/bundle-upstream.git"
+mkdir -p "$bsrc"
+commit() { git -C "$1" commit -q --allow-empty -m "$2"; }
+
+git init -q "$bsrc/solo"; commit "$bsrc/solo" one; commit "$bsrc/solo" two
+git -C "$bsrc/solo" branch -q side
+git -C "$bsrc/solo" worktree add -q "$bsrc/solo-wt" side 2>/dev/null
+git init -q "$bsrc/nested/deep"; commit "$bsrc/nested/deep" only
+git init -q "$bsrc/empty"
+git init -q "$bsrc/app/node_modules/pkg"; commit "$bsrc/app/node_modules/pkg" vendored
+git init -q --bare "$bup"
+git init -q "$bsrc/pushed"; commit "$bsrc/pushed" base
+git -C "$bsrc/pushed" remote add origin "$bup"; git -C "$bsrc/pushed" push -q origin HEAD:main
+git clone -q "$bup" "$bsrc/ahead"; commit "$bsrc/ahead" unpushed
+
+out=$("$DS" bundle --source "$bsrc" 2>&1); status=$?
+check "bundle with no destination is refused" "$status" "2"
+
+out=$("$DS" bundle -n --source "$bsrc" --dest "$bdest" 2>&1)
+has_not "$bdest" "a dry run writes nothing"
+
+out=$("$DS" bundle --source "$bsrc" --dest "$bdest" 2>&1); status=$?
+check "bundle succeeds" "$status" "0"
+want_grep "3 written, 0 unchanged, 0 removed, 1 empty" "$out" "three repositories bundled and the empty one counted"
+has "$bdest/solo.bundle" "a repository with no remote is bundled"
+has "$bdest/nested__deep.bundle" "a nested repository is named by its path"
+has "$bdest/ahead.bundle" "a repository with unpushed commits is bundled"
+has_not "$bdest/pushed.bundle" "a repository with everything pushed is not"
+want_grep "requires" "$(git -C "$bsrc/ahead" bundle verify "$bdest/ahead.bundle" 2>&1)" \
+  "an unpushed-only bundle leaves out what the remote holds"
+has_not "$bdest/app__node_modules__pkg.bundle" "nothing under node_modules is bundled"
+has_not "$bdest/solo-wt.bundle" "a worktree is carried by its repository, not bundled twice"
+
+git clone -q "$bdest/solo.bundle" "$work/solo-restored" 2>/dev/null
+check "a whole-history bundle clones to the same branches" \
+  "$(git -C "$work/solo-restored" for-each-ref --format='%(refname:lstrip=3)' refs/remotes/origin | grep -vx HEAD | sort | xargs)" \
+  "$(git -C "$bsrc/solo" for-each-ref --format='%(refname:short)' refs/heads | sort | xargs)"
+check "and the same tip" "$(git -C "$work/solo-restored" rev-parse HEAD)" "$(git -C "$bsrc/solo" rev-parse HEAD)"
+
+git clone -q "$bup" "$work/ahead-restored"
+git -C "$work/ahead-restored" fetch -q "$bdest/ahead.bundle" 'refs/heads/*:refs/restored/*' 2>/dev/null
+check "an unpushed-only bundle restores into a clone of its remote" \
+  "$(git -C "$work/ahead-restored" rev-parse refs/restored/main 2>/dev/null)" "$(git -C "$bsrc/ahead" rev-parse HEAD)"
+
+before=$(stat -c %Y "$bdest/solo.bundle"); sleep 1
+out=$("$DS" bundle --source "$bsrc" --dest "$bdest" 2>&1)
+want_grep "0 written, 3 unchanged" "$out" "a second run with no new refs writes nothing"
+check "and leaves the file untouched" "$(stat -c %Y "$bdest/solo.bundle")" "$before"
+
+commit "$bsrc/solo" three
+out=$("$DS" bundle --source "$bsrc" --dest "$bdest" 2>&1)
+want_grep "1 written, 2 unchanged" "$out" "a new commit rewrites that one bundle only"
+
+git -C "$bsrc/ahead" push -q origin HEAD:main
+out=$("$DS" bundle --source "$bsrc" --dest "$bdest" 2>&1)
+want_grep "removed   ahead.bundle" "$out" "once everything is pushed, its bundle is removed"
+has_not "$bdest/ahead.bundle" "and the file is gone"
+has_not "$bdest/.solo.bundle.partial" "no partial file is left behind"
 
 echo
 echo "------------------------------------------------------------------"

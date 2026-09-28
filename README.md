@@ -157,6 +157,34 @@ Slim compresses *better* precisely because the incompressible part is what it dr
 
 It lands under its own `-slim` label, so it never collides with a regular snapshot and — since `prune` is label-scoped — never consumes their retention either. `--max-file-size 50M` moves the cap.
 
+## History as bundles
+
+The slim warning above has a partner. In a repository with no remote, its `.git` is the only copy of its history, and a snapshot taken weekly is a week of history at risk. `bundle` covers that separately and cheaply:
+
+```bash
+dev-snapshot bundle --dest ~/Backups/bundles
+```
+
+It writes one [git bundle](https://git-scm.com/docs/git-bundle) per repository under the source, and a file-level backup (Déjà Dup, restic, rsync) carries the folder from there.
+
+- **A repository with no remote gets its whole history**, and restores with `git clone repo.bundle`.
+- **A repository with a remote gets only what no remote has.** That bundle depends on commits the remote holds, so it restores into a fresh clone of the remote: `git fetch repo.bundle 'refs/heads/*:refs/restored/*'`. When everything is pushed there is no bundle, and an old one is removed.
+- **Each name is stable, taken from the repository's path** (`shop/web` becomes `shop__web.bundle`). **A bundle is rewritten only when that repository's refs changed**, so a backup tool that versions files keeps one version per change and sees nothing on a quiet day.
+- Worktrees are carried by their repository, and nothing under `node_modules` or `.venv` is bundled.
+
+Each bundle is written to a temporary file, checked with `git bundle verify`, and only then renamed into place. On the tree this was built for, 61 repositories came to 22 MB, in 20 seconds the first time and 7 seconds on a day with no new commits. Set `BUNDLE_DEST` in the config to drop the flag; it is kept apart from `DEST` so bundles never land among the snapshots.
+
+## On a timer
+
+`--if-older-than DAYS` makes `create` do nothing unless the newest snapshot with the same label is at least that old. A daily timer can then keep a cadence without tracking one:
+
+```bash
+dev-snapshot create --slim --if-older-than 7 -y
+dev-snapshot create --if-older-than 30 -y
+```
+
+The check is per label, so a fresh slim snapshot never makes a regular one look done.
+
 ## Adding your own rules
 
 ```bash
