@@ -546,15 +546,18 @@ export GIT_COMMITTER_NAME="Test Author" GIT_COMMITTER_EMAIL="author@example.test
 bsrc="$work/bundle-src"; bdest="$work/bundle-dest"; bup="$work/bundle-upstream.git"
 mkdir -p "$bsrc"
 commit() { git -C "$1" commit -q --allow-empty -m "$2"; }
+# A fixture names its first branch itself: a plain git init takes the machine's default, and that is
+# master on some machines and main on others, while the tests below ask for main.
+init() { git init -q "$@" && git -C "${@: -1}" symbolic-ref HEAD refs/heads/main; }
 
-git init -q "$bsrc/solo"; commit "$bsrc/solo" one; commit "$bsrc/solo" two
+init "$bsrc/solo"; commit "$bsrc/solo" one; commit "$bsrc/solo" two
 git -C "$bsrc/solo" branch -q side
 git -C "$bsrc/solo" worktree add -q "$bsrc/solo-wt" side 2>/dev/null
-git init -q "$bsrc/nested/deep"; commit "$bsrc/nested/deep" only
-git init -q "$bsrc/empty"
-git init -q "$bsrc/app/node_modules/pkg"; commit "$bsrc/app/node_modules/pkg" vendored
-git init -q --bare "$bup"
-git init -q "$bsrc/pushed"; commit "$bsrc/pushed" base
+init "$bsrc/nested/deep"; commit "$bsrc/nested/deep" only
+init "$bsrc/empty"
+init "$bsrc/app/node_modules/pkg"; commit "$bsrc/app/node_modules/pkg" vendored
+init --bare "$bup"
+init "$bsrc/pushed"; commit "$bsrc/pushed" base
 git -C "$bsrc/pushed" remote add origin "$bup"; git -C "$bsrc/pushed" push -q origin HEAD:main
 git clone -q "$bup" "$bsrc/ahead"; commit "$bsrc/ahead" unpushed
 
